@@ -6,7 +6,9 @@ import lang::ofg::ast::Java2OFG;
 import lang::ofg::ast::FlowLanguage;
 import lang::java::jdt::m3::AST;
 
+public bool verbose = false;
 public loc elib = |project://eLib/|;
+public loc project;
 public AST asts;
 public Program ofg;
 public set[Decl] decls;
@@ -16,20 +18,20 @@ public map[loc, loc] declToType;
 lrel[loc, str] suggestions = [];
 
 rel[loc, str] expectedSuggestions = {
-	<|java+field:///User/loans|, "Collection\<Loan\>">,
+	<|java+field:///User/loans|, "Collection\<Loan\>">
 	/*
-	<|java+field:///Library/loans|, "Collection\<Loan\> loans = new LinkedList\<\>();">,
-	<|java+field:///Library/documents|, "Map\<Integer, Document\> = new HashMap\<\>();">,
-	<|java+field:///Library/users|, "Map\<Integer, User\> = new HashMap\<\>();">,
-	<|java+method:///Library/searchUser(String)/return|, "public List\<User\> searchUser(String name)">,
-	<|java+variable:///Main/searchUser(String)/users|, "List\<User\> users = lib.searchUser(args[0]);">,
-	<|java+variable:///Main/searchDoc(String)/docs|, "List\<Document\> docs = lib.searchDocumentByTitle(args[0]);">,
-	<|java+variable:///Library/searchUser(String)/usersFound|, "List\<User\> usersFound = new LinkedList\<\>();">,
-	<|java+method:///Library/searchDocumentByTitle(String)/return|, "public List\<Document\> searchDocumentByTitle(String)">,
-	<|java+variable:///Library/searchDocumentByTitle(String)/docsFound|, "List\<Document\> docsFound = new LinkedList\<\>();">,
-	<|java+method:///Library/searchDocumentByAuthor(String)/return|, "public List\<Document\> searchDocumentByAuthor(String)">,
+	,<|java+field:///Library/loans|, "Collection\<Loan\> loans = new LinkedList\<\>();">
+	,<|java+field:///Library/documents|, "Map\<Integer, Document\> = new HashMap\<\>();">
+	,<|java+field:///Library/users|, "Map\<Integer, User\> = new HashMap\<\>();">
+	,<|java+method:///Library/searchUser(String)/return|, "public List\<User\> searchUser(String name)">
+	,<|java+variable:///Main/searchUser(String)/users|, "List\<User\> users = lib.searchUser(args[0]);">
+	,<|java+variable:///Main/searchDoc(String)/docs|, "List\<Document\> docs = lib.searchDocumentByTitle(args[0]);">
+	,<|java+variable:///Library/searchUser(String)/usersFound|, "List\<User\> usersFound = new LinkedList\<\>();">
+	,<|java+method:///Library/searchDocumentByTitle(String)/return|, "public List\<Document\> searchDocumentByTitle(String)">
+	,<|java+variable:///Library/searchDocumentByTitle(String)/docsFound|, "List\<Document\> docsFound = new LinkedList\<\>();">
+	,<|java+method:///Library/searchDocumentByAuthor(String)/return|, "public List\<Document\> searchDocumentByAuthor(String)">
 	*/
-	<|java+variable:///Library/searchDocumentByAuthor(String)/docsFound|, "List\<Document\>">
+	,<|java+variable:///Library/searchDocumentByAuthor(String)/docsFound|, "List\<Document\>">
 };
 
 public set[str] containerClasses =  {
@@ -44,15 +46,45 @@ public set[str] containerClasses =  {
 	,"/java/util/LinkedList"
 };
 
+public set[str] mapClasses = {
+	"/java/util/Map"
+   ,"/java/util/HashMap"
+};
+
 public str basename(str path) {
-	if(/.*\/<basename:[^\/]*>$/ := path)
+	if(/\/<basename:[^\/]*>$/ := path)
+		return basename;
+	return "";
+}
+public str dirname(str path) {
+	if(/<dirname:.*\/>/ := path)
+		return dirname;
+	return "";
+}
+public str pbasename(str path) {
+	if(/<basename:[^\.]*$>/ := path)
 		return basename;
 	return "";
 }
 public set[str] containerClassesSimple = {basename(path) | path <- containerClasses};
 
 public void main(list[str] args) {
-	set_up(elib);
+	if(isEmpty(args))
+		project = elib;
+	else
+		project = |project://<args[0]>|;
+		/*
+		{
+			file = args[0];
+			if(file[0] == "/")
+				project = |file://<file>|;
+			else
+				project = |cwd:///<file>|;
+		}
+		*/
+	add_suggestions();
+	for(<var, newtype> <- suggestions) println("suggestion: declare <var>
+											   '                 as <newtype>");
 }
 
 public void set_up(loc location) {
@@ -60,10 +92,18 @@ public void set_up(loc location) {
 	asts = createAstsFromEclipseProject(location, true);
 	stms = {s | /Stm s:_ <- ofg};
 	decls = {d | /Decl d:_ <- ofg};
+
+	// FIXME only single fragments are supported atm for fields / vars
+	// e.g. "List x;" but not "List x, j;" 
+	fieldToType = (frag@decl: tipo@decl | /field(simpleType(tipo:_), frags:[frag:_]) <- asts);
+	varToType = (frag@decl: tipo@decl | /variables(simpleType(tipo:_), frags:[frag:_]) <- asts);
+	methToType = (m@decl: tipo@decl | /m:method(simpleType(tipo:_), name:_, parameters:_, exceptions:_, impl:_) <- asts)
+			   + (m@decl: tipo@decl | /m:method(simpleType(tipo:_), name:_, parameters:_, exceptions:_) <- asts);
+	declToType = fieldToType + varToType + methToType;
 }
 
 public void print_all() {
-	set_up(elib);
+	set_up(project);
 	visit(ofg) {
 		case n:newAssign(target, class, ctor, actualParameters):
 			println("Stm: newAssign\ntarget\t<target
@@ -81,39 +121,51 @@ public void print_all() {
 	};
 }
 
-public list[loc] infer_type(loc source) {
-	println("inferring type of <source>");
-	scheme = source.scheme;
-	authority = source.authority;
-	path = source.path;
-	return switch(source.scheme) {
+public str infer_type(loc target) {
+	if(verbose) println("inferring type of <target>");
+	list[loc] sources = [];
+	// FIXME implement casts
+	switch(target.scheme) {
+		// hmm
 		case "java+parameter": {
-			// println("path is <path>");
-			if(/<method:[^(]*>\(<tipo:[^)]*>\)/ := path) {
-				//println("method is <method>, type is <tipo>");
-				return [|java+type:///<tipo>|];
-			} else {
-				return [|error:///methodparse|];
-			}
+			if(/<method:[^(]*>\(<tipo:[^)]*>\)/ := target.path)
+				return "<tipo>";
 		}
-		case _: {
-			return [|id:///|];
+		case "java+constructor": {
+			if(/<tipo:[^(]*>/ := basename(target.path))
+				return tipo; 
 		}
+		case "java+variable":
+			;
+		case "java+field":
+			;
+		case "java+method": {
+			retval = target + "/return";
+			sources = [ source | assign(retval, _, source:_) <- stms];
+		}
+	};
+	tipo = declToType[target];
+	if(!isContainer(tipo))
+		return basename(tipo.path);
+	if(isEmpty(sources)) {
+		sources = [ source | assign(target, _, source:_) <- stms]
+				+ [ source | call(target, _, _, source:_, _) <- stms]
+				;
 	}
+	for(source <- sources) {
+		return infer_type(source);
+	}
+	return "error: unknown";
 }
 
-public void add_suggestion_for_loans() {
-	set_up(elib);
-	loc userloans = |java+field:///User/loans|;
-	list[Stm] assignstouserloans = [ a | /a:assign(userloans, _, _) <- stms];
-	println(assignstouserloans);
-	Stm assignstm = assignstouserloans[0];
-	assign(assigntarget, assigncast, assignsource) = assignstm;
-	result = infer_type(assignsource);
-	if(result.scheme == "java+type" && /.<tipo:.*>/ := result.path) {
-		suggestions += <userloans, tipo>;
-	} 
-	println(suggestions);
+public str infer_key_type(loc var) {
+	// var is the location of the Map instance
+	// just search for any .put assignment and derive the type of the key
+	puts = [ key | /m:methodCall(_, recv:_, "put", [key:_, _]) <- asts, recv@decl == var];
+	if(isEmpty(puts))
+		return "ERROR";
+	else
+		return infer_type(puts[0]@decl);
 }
 
 /* TODO does this catch exactly what we want? (only parameterless generic containers)
@@ -125,44 +177,20 @@ public bool isContainer(loc tipo) {
 }
 
 public void add_suggestions() {
-	set_up(elib);
-	
-	// FIXME only single fragments are supported atm for fields / vars
-	// e.g. "List x;" but not "List x, j;" 
-	fieldToType = (frag@decl: tipo@decl | /field(simpleType(tipo:_), frags:[frag:_]) <- asts, isContainer(tipo@decl));
-	varToType = (frag@decl: tipo@decl | /variables(simpleType(tipo:_), frags:[frag:_]) <- asts, isContainer(tipo@decl));
-	methToType = (m@decl: tipo@decl | /m:method(simpleType(tipo:_), name:_, parameters:_, exceptions:_, impl:_) <- asts, isContainer(tipo@decl))
-			   + (m@decl: tipo@decl | /m:method(simpleType(tipo:_), name:_, parameters:_, exceptions:_) <- asts, isContainer(tipo@decl));
-	declToType = fieldToType + varToType + methToType;
-	// for(m <- methToType) { println("methtotype: <m>: <methToType[m]>"); }
-	//news = [n | n:newAssign(target, class, ctor, actualParameters) <- stms];
-	//loc userloans = |java+field:///User/loans|;
-	//println("\nNEW"); for(n:newAssign(userloans, class, ctor, actualParameters) <- stms) println(class);
-	//println("\nASSIGN"); for(a:assign(userloans, cast, source) <- stms) println(source);
-	//for(m <- declToType) println("declToType: <m>: <declToType[m]>");
-	
+	set_up(project);
 	for(var <- declToType) {
 		tipo = declToType[var];
-		// if(tipo != |java+interface:///java/util/Map|) continue;
-		println("\nvar: <var>, type: <tipo>");
-		assigns = [ a | a:assign(var, _, _) <- stms];
-		for(assign(_, cast, source) <- assigns) print("assign: cast <cast>, source <source>\n\n");
-		bool found = false;
-		for(assign(target, cast, source) <- assigns) {
-			types = infer_type(source);
-			types = [tipo | result <- types, result.scheme == "java+type", /.<tipo:.*>/ := result.path];
-			if(!isEmpty(types)) {
-				generic = basename(declToType[var].path);
-				correction = "<generic>\<<intercalate(", ", types)>\>";
-				suggestions += <var, correction>;
-				found = true;
-				// break;
-			}
-		}
-		if(!found) {
-			println("could not infer type for <var>");
-		}
-		// break;
+		//if(var != |java+variable:///Main/searchDoc(java.lang.String)/docs|)
+		//	continue;
+		if(!isContainer(tipo))
+			continue;
+		// println("\nvar: <var>, type: <tipo>");
+		types = [];
+		if(tipo.path in mapClasses)
+			types += infer_key_type(var);
+		types += infer_type(var);
+		generic = basename(tipo.path);
+		correction = "<generic>\<<intercalate(", ", types)>\>";
+		suggestions += <var, correction>;
 	}
-	for(<var, newtype> <- suggestions) println("suggestion: declare <var>\n\tas <newtype>");
 }
