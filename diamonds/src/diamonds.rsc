@@ -17,23 +17,6 @@ public map[loc, loc] declToType;
 
 lrel[loc, str] suggestions = [];
 
-rel[loc, str] expectedSuggestions = {
-	<|java+field:///User/loans|, "Collection\<Loan\>">
-	/*
-	,<|java+field:///Library/loans|, "Collection\<Loan\> loans = new LinkedList\<\>();">
-	,<|java+field:///Library/documents|, "Map\<Integer, Document\> = new HashMap\<\>();">
-	,<|java+field:///Library/users|, "Map\<Integer, User\> = new HashMap\<\>();">
-	,<|java+method:///Library/searchUser(String)/return|, "public List\<User\> searchUser(String name)">
-	,<|java+variable:///Main/searchUser(String)/users|, "List\<User\> users = lib.searchUser(args[0]);">
-	,<|java+variable:///Main/searchDoc(String)/docs|, "List\<Document\> docs = lib.searchDocumentByTitle(args[0]);">
-	,<|java+variable:///Library/searchUser(String)/usersFound|, "List\<User\> usersFound = new LinkedList\<\>();">
-	,<|java+method:///Library/searchDocumentByTitle(String)/return|, "public List\<Document\> searchDocumentByTitle(String)">
-	,<|java+variable:///Library/searchDocumentByTitle(String)/docsFound|, "List\<Document\> docsFound = new LinkedList\<\>();">
-	,<|java+method:///Library/searchDocumentByAuthor(String)/return|, "public List\<Document\> searchDocumentByAuthor(String)">
-	*/
-	,<|java+variable:///Library/searchDocumentByAuthor(String)/docsFound|, "List\<Document\>">
-};
-
 public set[str] containerClasses =  {
 	 "/java/util/Map"
 	,"/java/util/HashMap"
@@ -73,21 +56,13 @@ public void main(list[str] args) {
 		project = elib;
 	else
 		project = |project://<args[0]>|;
-		/*
-		{
-			file = args[0];
-			if(file[0] == "/")
-				project = |file://<file>|;
-			else
-				project = |cwd:///<file>|;
-		}
-		*/
 	add_suggestions();
 	for(<var, newtype> <- suggestions) println("suggestion: declare <var>
 											   '                 as <newtype>");
 }
 
 public void set_up(loc location) {
+	suggestions = [];
 	ofg = createOFG(location);
 	asts = createAstsFromEclipseProject(location, true);
 	stms = {s | /Stm s:_ <- ofg};
@@ -102,23 +77,36 @@ public void set_up(loc location) {
 	declToType = fieldToType + varToType + methToType;
 }
 
-public void print_all() {
-	set_up(project);
-	visit(ofg) {
-		case n:newAssign(target, class, ctor, actualParameters):
-			println("Stm: newAssign\ntarget\t<target
-			>\nclass\t<class>\nctor\t<ctor>\nparams\t<actualParameters>\n");
-		case a:assign(target, cast, source):
-			println("Stm: assign\ntarget\t<target>\ncast\t<cast>\nsource\t<source>\n");
-		case c:call(target, cast, receiver, method, actualParameters):
-			println("Stm: call\ntarget\t<target>\ncast\t<cast>\nreivr\t<receiver>\nmethod\t<method>\nparams\t<actualParameters>\n");
-		case a:attribute(id):
-				println("Dec: attribute\tid\t<id>");
-		case m:method(id, formalParameters):
-			println("Dec: method\nid\t<id>\nparams\t<formalParameters>\n");
-		case c:constructor(id, formalParameters):
-			println("Dec: ctor\nid\t<id>\nparams\t<formalParameters>\n");
-	};
+public list[str] super_types(str tipo) {
+	extends = [s@decl | /\class(tipo, [simpleType(s:simpleName(_))], _, _) <- asts];
+	if(!isEmpty(extends)) {
+		return [tipo] + super_types(extends[0].path[1..]); 
+	}
+	return [tipo, "Object"];
+}
+
+public str least_common_super_type(list[str] types) {
+	if(size(types) == 1)
+		return types[0];
+	stypes = [super_types(tipo) | tipo <- types];
+	if(isEmpty(stypes))
+		return "error: super types";
+	bool common; 
+	for(t <- stypes[0]) {
+		common = true;
+		for(other <- stypes[1..]) {
+			if(indexOf(other, t) == -1)
+				common = false;
+		}
+		if(common)
+			return t;
+	}
+}
+
+public loc cast_or_source(loc cast, loc source) {
+	if(cast != |id:///|)
+		return cast;
+	return source;
 }
 
 public str infer_type(loc target) {
@@ -126,34 +114,34 @@ public str infer_type(loc target) {
 	list[loc] sources = [];
 	// FIXME implement casts
 	switch(target.scheme) {
-		// hmm
-		case "java+parameter": {
+		case "java+parameter":
 			if(/<method:[^(]*>\(<tipo:[^)]*>\)/ := target.path)
 				return "<tipo>";
-		}
-		case "java+constructor": {
+		case "java+constructor":
 			if(/<tipo:[^(]*>/ := basename(target.path))
 				return tipo; 
-		}
+		case "java+class":
+			return target.path;
 		case "java+variable":
 			;
 		case "java+field":
 			;
 		case "java+method": {
 			retval = target + "/return";
-			sources = [ source | assign(retval, _, source:_) <- stms];
+			sources = [ cast_or_source(cast, source) | assign(retval, cast:_, source:_) <- stms];
 		}
 	};
 	tipo = declToType[target];
 	if(!isContainer(tipo))
 		return basename(tipo.path);
 	if(isEmpty(sources)) {
-		sources = [ source | assign(target, _, source:_) <- stms]
-				+ [ source | call(target, _, _, source:_, _) <- stms]
-				;
+		casts = [ cast | assign(target, cast:_, source:_) <- stms];
+		sources = [ cast_or_source(cast, source) | assign(target, cast:_, source:_) <- stms]
+				+ [ cast_or_source(cast, source) | call(target, _, cast:_, source:_, _) <- stms];
 	}
-	for(source <- sources) {
-		return infer_type(source);
+	types = [ infer_type(source) | source <- sources];
+	if(!isEmpty(types)) {
+		return least_common_super_type(types);
 	}
 	return "error: unknown";
 }
@@ -168,9 +156,6 @@ public str infer_key_type(loc var) {
 		return infer_type(puts[0]@decl);
 }
 
-/* TODO does this catch exactly what we want? (only parameterless generic containers)
- * qualifiedType is missing for sure, as well as wildcard (?)  
- **/
 public bool isContainer(loc tipo) {
 	return (tipo.scheme == "java+interface" || tipo.scheme == "java+class")
 		&& tipo.path in containerClasses;
